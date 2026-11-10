@@ -1,0 +1,62 @@
+From d2e8b5c95376569b70a9ea47d417b164c1c3f830 Mon Sep 17 00:00:00 2001
+From: csmillie <csmillie@gmail.com>
+Date: Mon, 9 Nov 2026 20:39:59 -0500
+Subject: [PATCH 3/6] Enable keepalive by default
+
+Tests on 2026-11-09 confirmed the idle timeout. With fbcon cursor
+blink disabled the LED was green at +3.1 s and red at +5.1 s, and
+resumed traffic did not recover it. A modetest framebuffer swap went
+black without keepalive and held its test pattern with keepalive_ms=1000.
+
+Default keepalive_ms to 1000, well inside the 3-5 s window, and log
+each keepalive at debug level so a static screen does not add a log
+line every second.
+---
+ ms912x_transfer.c | 21 +++++++++++----------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/ms912x_transfer.c b/ms912x_transfer.c
+index 7000865..ec5ffc7 100644
+--- a/ms912x_transfer.c
++++ b/ms912x_transfer.c
+@@ -323,15 +323,16 @@ unlock:
+ }
+ 
+ /*
+- * Diagnostic keepalive for the suspected controller idle timeout. When no
+- * frame update has been queued for keepalive_ms, resend a 2x1 rect copied
+- * from the most recently queued request, so the pixels sent are the ones
+- * the device should already be showing. 0 disables it.
++ * The controller stops its video output 3-5 seconds after the last bulk
++ * frame update, and later updates do not bring it back. When no frame
++ * update has been queued for keepalive_ms, resend a 2x1 rect copied from
++ * the most recently queued request, so the pixels sent are the ones the
++ * device should already be showing. 0 disables it.
+  */
+-static unsigned int keepalive_ms;
++static unsigned int keepalive_ms = 1000;
+ module_param(keepalive_ms, uint, 0644);
+ MODULE_PARM_DESC(keepalive_ms,
+-		 "Resend a 2x1 rect after this many idle ms, 0 to disable (default: 0)");
++		 "Resend a 2x1 rect after this many idle ms, 0 to disable (default: 1000)");
+ 
+ #define MS912X_KEEPALIVE_POLL_MS	1000
+ #define MS912X_KEEPALIVE_WIDTH		2
+@@ -403,10 +404,10 @@ static void ms912x_keepalive_work(struct work_struct *work)
+ 		} else if (ms912x_keepalive_queue(ms912x)) {
+ 			ms912x->last_send = jiffies;
+ 			ms912x->keepalive_sent++;
+-			pr_info_ratelimited("ms912x keepalive: sent=%u skipped=%u idle_ms=%u\n",
+-					    ms912x->keepalive_sent,
+-					    ms912x->keepalive_skipped,
+-					    interval);
++			pr_debug("ms912x keepalive: sent=%u skipped=%u idle_ms=%u\n",
++				 ms912x->keepalive_sent,
++				 ms912x->keepalive_skipped,
++				 interval);
+ 		} else {
+ 			ms912x->keepalive_skipped++;
+ 		}
+-- 
+2.56.0
+

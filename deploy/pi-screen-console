@@ -1,0 +1,23 @@
+#!/bin/bash
+# Detach (off) or reattach (on) the Linux text console from the framebuffer,
+# so the login prompt and its blinking cursor do not draw over the dashboard.
+#
+# Runs as root from the pi-screen systemd unit (ExecStartPre=+ / ExecStopPost=+).
+# Install root-owned: sudo install -m 0755 -o root -g root pi-screen-console /usr/local/sbin/
+set -euo pipefail
+
+case "${1:-}" in
+	off) bind=0 ;;
+	on) bind=1 ;;
+	*) echo "usage: $0 off|on" >&2; exit 2 ;;
+esac
+
+for vtcon in /sys/class/vtconsole/vtcon*; do
+	if grep -q "frame buffer device" "$vtcon/name"; then
+		echo "$bind" > "$vtcon/bind"
+		exit 0
+	fi
+done
+
+# No framebuffer console, e.g. the LCD is unplugged: nothing to do.
+exit 0

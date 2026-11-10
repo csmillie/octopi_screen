@@ -1,0 +1,176 @@
+From 2e226ff0d4a6cfc364737fd02cddeee7e9182de6 Mon Sep 17 00:00:00 2001
+From: csmillie <csmillie@gmail.com>
+Date: Mon, 9 Nov 2026 20:52:34 -0500
+Subject: [PATCH 4/6] Quiet per-transfer and per-enable logging
+
+Every cursor blink logged a RECT line and a USB OK line, about ten per
+second, and every keepalive added another. Several messages also
+printed a literal "\n" because of an escaped backslash.
+
+- Per-transfer, per-enable and framebuffer-swap traces now use drm_dbg
+  and are visible with drm.debug=0x2.
+- The register snapshots taken around power on and output enable cost
+  twelve USB control reads per enable, so they are skipped unless
+  DRM_UT_DRIVER debugging is enabled.
+- Probe-time messages (chip signature, custom timing, port type) stay
+  at info level.
+- Errors are unchanged apart from the newline fix.
+---
+ ms912x_drv.c       | 16 ++++++++--------
+ ms912x_registers.c | 19 ++++++++++++-------
+ ms912x_transfer.c  | 12 ++++++------
+ 3 files changed, 26 insertions(+), 21 deletions(-)
+
+diff --git a/ms912x_drv.c b/ms912x_drv.c
+index d3b5d5f..8bcd628 100644
+--- a/ms912x_drv.c
++++ b/ms912x_drv.c
+@@ -313,7 +313,7 @@ static void ms912x_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	struct ms912x_device *ms912x = to_ms912x(dev);
+ 	int ret;
+ 
+-	drm_info(dev, "DIAGNOSTIC: CRTC DISABLE invoked\n");
++	drm_dbg(dev, "CRTC disable\n");
+ 	ms912x_keepalive_stop(ms912x);
+ 	ms912x_cancel_transfer_work(ms912x);
+ 	ret = ms912x_power_off(ms912x);
+@@ -392,8 +392,8 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
+ 	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
+ 
+ 	if (!new_plane_state->fb) {
+-		drm_info(plane->dev,
+-			"TRACE plane: framebuffer removed old=%u\\n",
++		drm_dbg(plane->dev,
++			"TRACE plane: framebuffer removed old=%u\n",
+ 			old_plane_state->fb ? old_plane_state->fb->base.id : 0);
+ 		return;
+ 	}
+@@ -403,8 +403,8 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
+ 
+ 	if (old_plane_state->fb != new_plane_state->fb ||
+ 	    drm_atomic_crtc_needs_modeset(new_crtc_state))
+-		drm_info(plane->dev,
+-			"TRACE plane: old_fb=%u new_fb=%u modeset=%d size=%ux%u\\n",
++		drm_dbg(plane->dev,
++			"TRACE plane: old_fb=%u new_fb=%u modeset=%d size=%ux%u\n",
+ 			old_plane_state->fb ? old_plane_state->fb->base.id : 0,
+ 			new_plane_state->fb->base.id,
+ 			drm_atomic_crtc_needs_modeset(new_crtc_state),
+@@ -424,8 +424,8 @@ static void ms912x_plane_atomic_update(struct drm_plane *plane,
+ 		ms912x_merge_rects(&rect, &current_rect, &ms912x->update_rect);
+ 		if (old_plane_state->fb != new_plane_state->fb ||
+ 		    drm_atomic_crtc_needs_modeset(new_crtc_state))
+-			drm_info(plane->dev,
+-				"TRACE damage: x=%d y=%d width=%d height=%d\\n",
++			drm_dbg(plane->dev,
++				"TRACE damage: x=%d y=%d width=%d height=%d\n",
+ 				rect.x1, rect.y1,
+ 				rect.x2 - rect.x1, rect.y2 - rect.y1);
+ 		if (ms912x_fb_send_rect(new_plane_state->fb,
+@@ -532,7 +532,7 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 		ms912x->num_custom_modes = 1;
+ 
+ 		drm_info(&ms912x->drm,
+-			 "experimental RAM-only mode: %s, ID 0x96\\n",
++			 "experimental RAM-only mode: %s, ID 0x96\n",
+ 			 m->name);
+ 	}
+ 
+diff --git a/ms912x_registers.c b/ms912x_registers.c
+index 614d1b3..4f075cb 100644
+--- a/ms912x_registers.c
++++ b/ms912x_registers.c
+@@ -8,6 +8,7 @@
+ 
+ #include <drm/drm_drv.h>
+ #include <drm/drm_modes.h>
++#include <drm/drm_print.h>
+ 
+ #include "ms912x.h"
+ 
+@@ -311,10 +312,14 @@ static void ms912x_debug_registers(struct ms912x_device *ms912x,
+     };
+     unsigned int i;
+ 
++    /* Each read is a USB control round trip, so only do them when asked. */
++    if (!drm_debug_enabled(DRM_UT_DRIVER))
++        return;
++
+     for (i = 0; i < ARRAY_SIZE(addresses); i++) {
+         int value = ms912x_read_byte(ms912x, addresses[i]);
+ 
+-        drm_info(&ms912x->drm,
++        drm_dbg(&ms912x->drm,
+                  "register snapshot %s: 0x%04x = %d (0x%02x)\n",
+                  stage, addresses[i], value,
+                  value >= 0 ? value : 0);
+@@ -332,8 +337,8 @@ int ms912x_power_on(struct ms912x_device *ms912x)
+ 
+ 	int ret = ms912x_write_6_bytes(ms912x, MS912X_CMD_POWER, data);
+ 
+-	drm_info(&ms912x->drm,
+-		 "power-on command result: %d\\n", ret);
++	drm_dbg(&ms912x->drm,
++		 "power-on command result: %d\n", ret);
+ 	return ret;
+ }
+ 
+@@ -409,15 +414,15 @@ int ms912x_set_resolution(struct ms912x_device *ms912x,
+ 	memset(data, 0, sizeof(data));
+ 	data[0] = 1;
+ 	ret = ms912x_write_6_bytes(ms912x, MS912X_CMD_OUTPUT_ENABLE, data);
+-	drm_info(&ms912x->drm,
+-		 "output-enable command result: %d\\n", ret);
++	drm_dbg(&ms912x->drm,
++		 "output-enable command result: %d\n", ret);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	ms912x_debug_registers(ms912x, "after-output");
+ 	ret = ms912x_read_byte(ms912x, MS912X_REG_DISPLAY_STATUS);
+-	drm_info(&ms912x->drm,
+-		 "display status after enable: %d\\n", ret);
++	drm_dbg(&ms912x->drm,
++		 "display status after enable: %d\n", ret);
+ 	if (ret < 0)
+ 		return ret;
+ 
+diff --git a/ms912x_transfer.c b/ms912x_transfer.c
+index ec5ffc7..53b1850 100644
+--- a/ms912x_transfer.c
++++ b/ms912x_transfer.c
+@@ -71,14 +71,15 @@ static void ms912x_request_work(struct work_struct *work)
+ 			ret = -EIO;
+ 
+ 		if (ret == 0)
+-			pr_info_ratelimited("ms912x USB OK: requested=%zu actual=%zu elapsed=%u ms\\n",
++			drm_dbg(&ms912x->drm,
++				"USB OK: requested=%zu actual=%zu elapsed=%u ms\n",
+ 				(size_t)request->transfer_len,
+ 				(size_t)sgr->bytes,
+ 				jiffies_to_msecs(jiffies - started));
+ 
+ 		if (ret < 0)
+ 			drm_err(&ms912x->drm,
+-				"USB transfer: requested=%zu actual=%zu status=%d elapsed=%u ms timer_active=%d\\n",
++				"USB transfer: requested=%zu actual=%zu status=%d elapsed=%u ms timer_active=%d\n",
+ 				(size_t)request->transfer_len,
+ 				(size_t)sgr->bytes,
+ 				sgr->status,
+@@ -297,10 +298,9 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb,
+ 	if (ret < 0)
+ 		goto request_complete;
+ 
+-	pr_info_ratelimited("MS912X RECT: x=%d y=%d w=%d h=%d fb=%ux%u\n",
+-			    rect->x1, rect->y1,
+-			    drm_rect_width(rect), drm_rect_height(rect),
+-			    fb->width, fb->height);
++	drm_dbg(drm, "rect: x=%d y=%d w=%d h=%d fb=%ux%u\n",
++		rect->x1, rect->y1, drm_rect_width(rect), drm_rect_height(rect),
++		fb->width, fb->height);
+ 
+ 	ms912x_fb_xrgb8888_to_yuv422(current_request->transfer_buffer, map, fb,
+ 				       rect, current_request->line_buffer);
+-- 
+2.56.0
+

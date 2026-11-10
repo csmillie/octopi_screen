@@ -1,0 +1,27 @@
+[Unit]
+Description=OctoPrint status dashboard on the MS912x USB LCD
+After=octoprint.service network-online.target
+Wants=network-online.target
+# Keep retrying while the LCD is unplugged; never give up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=octopi
+WorkingDirectory=/home/octopi/pi-screen
+Environment=PYTHONUNBUFFERED=1
+# "+" runs these two as root: detaching the text console from the
+# framebuffer needs root. The helper is root-owned in /usr/local/sbin so the
+# octopi user cannot change what runs here.
+ExecStartPre=+/usr/local/sbin/pi-screen-console off
+ExecStart=/home/octopi/pi-screen/.venv/bin/python -m pi_screen.app
+ExecStopPost=+/usr/local/sbin/pi-screen-console on
+# Exit status 3 means the LCD went away; restarting re-detaches the console
+# from a replugged LCD and redraws the whole screen.
+Restart=always
+RestartSec=5
+Nice=10
+MemoryMax=80M
+
+[Install]
+WantedBy=multi-user.target

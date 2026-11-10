@@ -1,0 +1,117 @@
+From 29d7c09082b3d9ba4a6925d501956021e36005a1 Mon Sep 17 00:00:00 2001
+From: csmillie <csmillie@gmail.com>
+Date: Mon, 9 Nov 2026 19:14:22 -0500
+Subject: [PATCH 2/6] Add read-only debugfs view of the output timing registers
+
+Expose the timing registers identified in re_notes/README.md through
+a new ms912x_timing debugfs file, decoded as 16-bit little endian
+values: hactive, vactive, htotal, vtotal, sync widths and porch
+offsets (0xf204-0xf207, 0xf382-0xf389, 0xf398-0xf3a7), plus the raw
+byte at 0xf26d, which is documented only as "hz?".
+
+This shows what the controller is actually outputting when custom
+mode 0x96 is selected, and whether that changes between a working
+(green LED) and a failed (red LED) state.
+
+Reads use the existing ms912x_read_byte() helper, the same 0xb5 read
+request the driver already uses for EDID and status registers. The
+RE notes swept this request across all 64K addresses on an MS9120
+(534d:6021) without problems; this unit is 345f:9132. Registers are
+read only when the debugfs file is opened. No writes are added.
+---
+ ms912x_drv.c | 73 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 73 insertions(+)
+
+diff --git a/ms912x_drv.c b/ms912x_drv.c
+index e07275d..d3b5d5f 100644
+--- a/ms912x_drv.c
++++ b/ms912x_drv.c
+@@ -96,12 +96,85 @@ static const struct file_operations ms912x_debugfs_registers_fops = {
+     .release = single_release,
+ };
+ 
++/*
++ * Timing registers identified in re_notes/README.md by diffing full
++ * register dumps taken in two different modes. All are 16-bit little
++ * endian. Read-only: uses the same 0xb5 read request as the EDID reads.
++ */
++static const struct {
++    u16 address;
++    const char *name;
++} ms912x_timing_registers[] = {
++    { 0xf204, "hactive (f204)" },
++    { 0xf206, "vactive (f206)" },
++    { 0xf382, "hactive (f382)" },
++    { 0xf384, "hactive (f384)" },
++    { 0xf386, "vactive (f386)" },
++    { 0xf388, "vactive (f388)" },
++    { 0xf398, "htotal" },
++    { 0xf39a, "vtotal" },
++    { 0xf39c, "hsync width" },
++    { 0xf39e, "vsync width" },
++    { 0xf3a0, "hsync + hbackporch" },
++    { 0xf3a2, "htotal - hfrontporch" },
++    { 0xf3a4, "vsync + vbackporch" },
++    { 0xf3a6, "vtotal - vfrontporch" },
++};
++
++static int ms912x_debugfs_timing_show(struct seq_file *m, void *unused)
++{
++    struct drm_device *dev = m->private;
++    struct ms912x_device *ms912x = to_ms912x(dev);
++    unsigned int i;
++    int lo, hi, hz;
++
++    for (i = 0; i < ARRAY_SIZE(ms912x_timing_registers); i++) {
++        u16 address = ms912x_timing_registers[i].address;
++
++        lo = ms912x_read_byte(ms912x, address);
++        hi = lo < 0 ? lo : ms912x_read_byte(ms912x, address + 1);
++        if (hi < 0)
++            seq_printf(m, "0x%04x %-22s error %d\n", address,
++                       ms912x_timing_registers[i].name, hi);
++        else
++            seq_printf(m, "0x%04x %-22s %5u (%02x %02x)\n", address,
++                       ms912x_timing_registers[i].name,
++                       lo | hi << 8, lo, hi);
++    }
++
++    /* Documented only as "hz?", so print the raw byte. */
++    hz = ms912x_read_byte(ms912x, 0xf26d);
++    if (hz < 0)
++        seq_printf(m, "0xf26d %-22s error %d\n", "hz?", hz);
++    else
++        seq_printf(m, "0xf26d %-22s %5d (%02x)\n", "hz?", hz, hz);
++
++    return 0;
++}
++
++static int ms912x_debugfs_timing_open(struct inode *inode, struct file *file)
++{
++    return single_open(file, ms912x_debugfs_timing_show, inode->i_private);
++}
++
++static const struct file_operations ms912x_debugfs_timing_fops = {
++    .owner = THIS_MODULE,
++    .open = ms912x_debugfs_timing_open,
++    .read = seq_read,
++    .llseek = seq_lseek,
++    .release = single_release,
++};
++
+ static void ms912x_debugfs_init(struct drm_minor *minor)
+ {
+     debugfs_create_file("ms912x_registers", 0400,
+                         minor->debugfs_root,
+                         minor->dev,
+                         &ms912x_debugfs_registers_fops);
++    debugfs_create_file("ms912x_timing", 0400,
++                        minor->debugfs_root,
++                        minor->dev,
++                        &ms912x_debugfs_timing_fops);
+ }
+ 
+ DEFINE_DRM_GEM_FOPS(ms912x_driver_fops);
+-- 
+2.56.0
+

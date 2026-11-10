@@ -1,0 +1,218 @@
+From befea6fa919fe0d8fc6121d252f29fdd0e941111 Mon Sep 17 00:00:00 2001
+From: csmillie <csmillie@gmail.com>
+Date: Mon, 9 Nov 2026 21:13:38 -0500
+Subject: [PATCH 5/6] Avoid and recover from a stuck bulk endpoint after DPMS
+
+After a CRTC disable/enable cycle the device sometimes accepts the
+first 1024 bytes of the next frame and then NAKs the bulk endpoint
+indefinitely. Every later transfer times out after 5 s and the display
+stays dark until the driver is reloaded. Tests on 2026-11-09:
+
+- Without changes: 4 wedges in 10 DPMS off/on cycles.
+- 200 ms between power off and power on, plus 100 ms after the mode
+  set: wedged on the first cycle. Not a power-on timing problem.
+- 300 ms quiet period after the last transfer, before power off:
+  1 wedge in 19 cycles.
+- CLEAR_FEATURE(ENDPOINT_HALT) after a timeout: did not recover.
+- A second CRTC disable/enable cycle after a timeout: recovered.
+
+Wait power_off_delay_ms (default 300) before powering off, and when a
+bulk transfer times out, force a modeset through the same
+disable/enable path DPMS uses (recover_on_timeout, default on). The
+forced modeset is limited to 5 attempts per 60 s, skipped if the
+CRTC is no longer active, and cancelled in disconnect before and
+after the transfer work is flushed.
+---
+ ms912x.h          |  5 +++
+ ms912x_drv.c      | 91 +++++++++++++++++++++++++++++++++++++++++++++++
+ ms912x_transfer.c | 13 +++++++
+ 3 files changed, 109 insertions(+)
+
+diff --git a/ms912x.h b/ms912x.h
+index 3bff492..8101262 100644
+--- a/ms912x.h
++++ b/ms912x.h
+@@ -142,6 +142,11 @@ struct ms912x_device {
+ 	bool keepalive_running;
+ 	unsigned int keepalive_sent;
+ 	unsigned int keepalive_skipped;
++
++	/* Forced modeset after a bulk transfer timeout, rate limited */
++	struct work_struct recovery_work;
++	unsigned long recovery_window_start;
++	unsigned int recovery_count;
+ };
+ 
+ struct ms912x_request {
+diff --git a/ms912x_drv.c b/ms912x_drv.c
+index 8bcd628..d2bfa4a 100644
+--- a/ms912x_drv.c
++++ b/ms912x_drv.c
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ 
+ #include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/limits.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -265,6 +266,20 @@ ms912x_get_mode(struct ms912x_device *ms912x,
+ 	return NULL;
+ }
+ 
++/*
++ * Powering off within a few ms of the last frame transfer sometimes leaves
++ * the device accepting only the first 1024 bytes of the next frame after
++ * power on, then NAKing the bulk endpoint until the driver is reloaded.
++ * This happened in 4 of 10 DPMS off/on cycles; with a 300 ms quiet period
++ * before power off it happened in 1 of 19. Delays between power on and the
++ * first frame made no difference. The remaining cases are handled by the
++ * forced modeset that runs when a transfer times out.
++ */
++static unsigned int power_off_delay_ms = 300;
++module_param(power_off_delay_ms, uint, 0644);
++MODULE_PARM_DESC(power_off_delay_ms,
++		 "Delay in ms after the last transfer before power off (default: 300)");
++
+ static void ms912x_crtc_atomic_enable(struct drm_crtc *crtc,
+ 				      struct drm_atomic_state *state)
+ {
+@@ -316,11 +331,83 @@ static void ms912x_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	drm_dbg(dev, "CRTC disable\n");
+ 	ms912x_keepalive_stop(ms912x);
+ 	ms912x_cancel_transfer_work(ms912x);
++	if (READ_ONCE(power_off_delay_ms))
++		msleep(READ_ONCE(power_off_delay_ms));
+ 	ret = ms912x_power_off(ms912x);
+ 	if (ret && ret != -ENODEV)
+ 		drm_err(dev, "failed to power off display: %d\n", ret);
+ }
+ 
++#define MS912X_MAX_RECOVERIES		5
++#define MS912X_RECOVERY_WINDOW		(60 * HZ)
++
++/*
++ * Run the same CRTC disable/enable sequence as a DPMS off/on cycle. The
++ * plane is added so the first frame after enable is a full update.
++ */
++static void ms912x_recovery_work(struct work_struct *work)
++{
++	struct ms912x_device *ms912x =
++		container_of(work, struct ms912x_device, recovery_work);
++	struct drm_device *dev = &ms912x->drm;
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct drm_crtc_state *crtc_state;
++	int idx, ret;
++
++	if (!drm_dev_enter(dev, &idx))
++		return;
++
++	if (!ms912x->recovery_count ||
++	    time_after(jiffies, ms912x->recovery_window_start +
++				MS912X_RECOVERY_WINDOW)) {
++		ms912x->recovery_window_start = jiffies;
++		ms912x->recovery_count = 0;
++	}
++	if (ms912x->recovery_count >= MS912X_MAX_RECOVERIES) {
++		drm_err_ratelimited(dev,
++				    "bulk timeout: %u recoveries in 60 s, giving up until the window passes\n",
++				    ms912x->recovery_count);
++		goto exit;
++	}
++	ms912x->recovery_count++;
++	drm_warn(dev, "bulk timeout: forcing modeset (attempt %u)\n",
++		 ms912x->recovery_count);
++
++	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
++
++	state = drm_atomic_state_alloc(dev);
++	if (!state) {
++		ret = -ENOMEM;
++		goto unlock;
++	}
++	state->acquire_ctx = &ctx;
++
++	crtc_state = drm_atomic_get_crtc_state(state, &ms912x->crtc);
++	if (IS_ERR(crtc_state)) {
++		ret = PTR_ERR(crtc_state);
++		goto put_state;
++	}
++
++	/* Nothing to recover if the display was turned off meanwhile. */
++	if (!crtc_state->active)
++		goto put_state;
++
++	crtc_state->mode_changed = true;
++	ret = drm_atomic_add_affected_planes(state, &ms912x->crtc);
++	if (!ret)
++		ret = drm_atomic_commit(state);
++
++put_state:
++	drm_atomic_state_put(state);
++unlock:
++	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
++	if (ret)
++		drm_err(dev, "bulk timeout: forced modeset failed: %d\n", ret);
++exit:
++	drm_dev_exit(idx);
++}
++
+ static enum drm_mode_status
+ ms912x_crtc_mode_valid(struct drm_crtc *crtc,
+ 		       const struct drm_display_mode *mode)
+@@ -489,6 +576,7 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 	ms912x->intf = interface;
+ 	mutex_init(&ms912x->ctrl_lock);
+ 	ms912x_keepalive_init(ms912x);
++	INIT_WORK(&ms912x->recovery_work, ms912x_recovery_work);
+ 
+ 	ret = usb_find_bulk_out_endpoint(interface->cur_altsetting, &bulk_out);
+ 	if (ret)
+@@ -646,9 +734,12 @@ static void ms912x_usb_disconnect(struct usb_interface *interface)
+ 
+ 	drm_kms_helper_poll_fini(dev);
+ 	drm_dev_unplug(dev);
++	cancel_work_sync(&ms912x->recovery_work);
+ 	drm_atomic_helper_shutdown(dev);
+ 	ms912x_keepalive_stop(ms912x);
+ 	ms912x_cancel_transfer_work(ms912x);
++	/* A transfer that timed out during shutdown may have queued it again. */
++	cancel_work_sync(&ms912x->recovery_work);
+ 	destroy_workqueue(ms912x->workqueue);
+ 	ms912x_free_request(&ms912x->keepalive_request);
+ 	ms912x_free_request(&ms912x->requests[0]);
+diff --git a/ms912x_transfer.c b/ms912x_transfer.c
+index 53b1850..6efb499 100644
+--- a/ms912x_transfer.c
++++ b/ms912x_transfer.c
+@@ -26,6 +26,16 @@
+ 
+ #include "ms912x.h"
+ 
++/*
++ * If the bulk endpoint stops accepting data, a CRTC disable/enable cycle
++ * brings it back; clearing the endpoint halt does not. Schedule one when a
++ * transfer times out.
++ */
++static bool recover_on_timeout = true;
++module_param(recover_on_timeout, bool, 0644);
++MODULE_PARM_DESC(recover_on_timeout,
++		 "Force a modeset when a bulk transfer times out (default: true)");
++
+ static void ms912x_request_timeout(struct timer_list *t)
+ {
+ 	struct ms912x_usb_request *request = from_timer(request, t, timer);
+@@ -85,6 +95,9 @@ static void ms912x_request_work(struct work_struct *work)
+ 				sgr->status,
+ 				jiffies_to_msecs(jiffies - started),
+ 				timer_active);
++
++		if (ret == -ETIMEDOUT && READ_ONCE(recover_on_timeout))
++			schedule_work(&ms912x->recovery_work);
+ 	}
+ 
+ dev_exit:
+-- 
+2.56.0
+

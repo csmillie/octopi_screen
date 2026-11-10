@@ -1,0 +1,312 @@
+From 14cfb3bb1b97e79c3926c07bff4665ec7d3c0cc3 Mon Sep 17 00:00:00 2001
+From: csmillie <csmillie@gmail.com>
+Date: Mon, 9 Nov 2026 19:13:48 -0500
+Subject: [PATCH 1/6] Add optional keepalive to test the controller idle
+ timeout
+
+The display goes black with a red LED about 3-4 seconds after a DRM
+client takes over the primary plane. On 2026-11-09 at 17:34:23 a
+modetest framebuffer was sent and no further USB traffic reached the
+device for 66 seconds. The fbcon console never idles that long
+because cursor blink sends an 8x16 update every ~210 ms. One theory
+is that the controller drops its output when no frame data arrives
+for a few seconds. This change exists to test that theory; it does
+not assume it is true.
+
+When the keepalive_ms parameter is non-zero and no frame update has
+been queued for that long, queue a 2x1 rect copied from the most
+recently queued request. The pixels match what the device should
+already be showing, so the image does not change. Each keepalive is
+20 bytes on the bus.
+
+Safety properties:
+- Disabled by default (keepalive_ms=0). The parameter is writable at
+  runtime through /sys/module/ms912x/parameters.
+- Keepalive uses its own request and only queues it after
+  try_wait_for_completion() succeeds, so two keepalive transfers can
+  never be in flight at once.
+- It is queued on the same ordered workqueue as frame updates, so it
+  cannot overlap or reorder with them.
+- A new send_lock covers request selection in ms912x_fb_send_rect()
+  and the copy in the keepalive worker, so the copy always reads the
+  last queued request and never a buffer being refilled.
+- Started at the end of CRTC enable. Stopped with
+  cancel_delayed_work_sync() and cancel_work_sync() at the start of
+  CRTC disable, which also covers suspend and the atomic shutdown in
+  disconnect. Disconnect calls stop again before destroying the
+  workqueue, and the worker never rearms after drm_dev_enter() fails.
+---
+ ms912x.h          |  14 +++++
+ ms912x_drv.c      |  12 ++++
+ ms912x_transfer.c | 140 ++++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 162 insertions(+), 4 deletions(-)
+
+diff --git a/ms912x.h b/ms912x.h
+index 73d4f32..3bff492 100644
+--- a/ms912x.h
++++ b/ms912x.h
+@@ -132,6 +132,16 @@ struct ms912x_device {
+ 	 */
+ 	int current_request;
+ 	struct ms912x_usb_request requests[2];
++
++	/* Serializes request selection between frame updates and keepalive */
++	struct mutex send_lock;
++	/* Resends a few pixels when no frame update has been sent recently */
++	struct delayed_work keepalive_work;
++	struct ms912x_usb_request keepalive_request;
++	unsigned long last_send;
++	bool keepalive_running;
++	unsigned int keepalive_sent;
++	unsigned int keepalive_skipped;
+ };
+ 
+ struct ms912x_request {
+@@ -210,4 +220,8 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb,
+ void ms912x_free_request(struct ms912x_usb_request *request);
+ int ms912x_init_request(struct ms912x_device *ms912x,
+ 			struct ms912x_usb_request *request, size_t len);
++
++void ms912x_keepalive_init(struct ms912x_device *ms912x);
++void ms912x_keepalive_start(struct ms912x_device *ms912x);
++void ms912x_keepalive_stop(struct ms912x_device *ms912x);
+ #endif
+diff --git a/ms912x_drv.c b/ms912x_drv.c
+index 44db515..e07275d 100644
+--- a/ms912x_drv.c
++++ b/ms912x_drv.c
+@@ -217,6 +217,8 @@ static void ms912x_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	ret = ms912x_set_resolution(ms912x, ms_mode);
+ 	if (ret)
+ 		drm_err(dev, "failed to set display mode: %d\n", ret);
++
++	ms912x_keepalive_start(ms912x);
+ }
+ 
+ static void ms912x_cancel_transfer_work(struct ms912x_device *ms912x)
+@@ -239,6 +241,7 @@ static void ms912x_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	int ret;
+ 
+ 	drm_info(dev, "DIAGNOSTIC: CRTC DISABLE invoked\n");
++	ms912x_keepalive_stop(ms912x);
+ 	ms912x_cancel_transfer_work(ms912x);
+ 	ret = ms912x_power_off(ms912x);
+ 	if (ret && ret != -ENODEV)
+@@ -412,6 +415,7 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 
+ 	ms912x->intf = interface;
+ 	mutex_init(&ms912x->ctrl_lock);
++	ms912x_keepalive_init(ms912x);
+ 
+ 	ret = usb_find_bulk_out_endpoint(interface->cur_altsetting, &bulk_out);
+ 	if (ret)
+@@ -499,6 +503,11 @@ static int ms912x_usb_probe(struct usb_interface *interface,
+ 	if (ret)
+ 		goto err_free_request_0;
+ 
++	ret = ms912x_init_request(ms912x, &ms912x->keepalive_request,
++				  PAGE_SIZE);
++	if (ret)
++		goto err_free_request_1;
++
+ 	ret = drm_universal_plane_init(dev, &ms912x->plane, 0,
+ 				       &ms912x_plane_funcs,
+ 				       ms912x_plane_formats,
+@@ -548,6 +557,7 @@ err_put_device:
+ 	}
+ 	drm_kms_helper_poll_fini(dev);
+ err_free_request_1:
++	ms912x_free_request(&ms912x->keepalive_request);
+ 	ms912x_free_request(&ms912x->requests[1]);
+ err_free_request_0:
+ 	ms912x_free_request(&ms912x->requests[0]);
+@@ -564,8 +574,10 @@ static void ms912x_usb_disconnect(struct usb_interface *interface)
+ 	drm_kms_helper_poll_fini(dev);
+ 	drm_dev_unplug(dev);
+ 	drm_atomic_helper_shutdown(dev);
++	ms912x_keepalive_stop(ms912x);
+ 	ms912x_cancel_transfer_work(ms912x);
+ 	destroy_workqueue(ms912x->workqueue);
++	ms912x_free_request(&ms912x->keepalive_request);
+ 	ms912x_free_request(&ms912x->requests[0]);
+ 	ms912x_free_request(&ms912x->requests[1]);
+ 	if (ms912x->dmadev) {
+diff --git a/ms912x_transfer.c b/ms912x_transfer.c
+index 1067bce..7000865 100644
+--- a/ms912x_transfer.c
++++ b/ms912x_transfer.c
+@@ -9,6 +9,8 @@
+ #include <linux/kernel.h>
+ #include <linux/math.h>
+ #include <linux/minmax.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+@@ -277,16 +279,18 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb,
+ 	width = min_t(int, ALIGN(rect->x2, 2), fb->width) - x;
+ 	rect->x1 = x;
+ 	rect->x2 = x + width;
+-	current_request = &ms912x->requests[ms912x->current_request];
+ 
+ 	if (!drm_dev_enter(drm, &idx))
+ 		return -ENODEV;
+ 
++	mutex_lock(&ms912x->send_lock);
++	current_request = &ms912x->requests[ms912x->current_request];
++
+ 	/* Transfer buffer still in use, drop this frame. */
+ 	if (!wait_for_completion_timeout(&current_request->done,
+ 					 msecs_to_jiffies(10))) {
+ 		ret = -ETIMEDOUT;
+-		goto dev_exit;
++		goto unlock;
+ 	}
+ 
+ 	ret = drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE);
+@@ -307,11 +311,139 @@ int ms912x_fb_send_rect(struct drm_framebuffer *fb,
+ 		width * 2 * drm_rect_height(rect) + MS912X_FRAME_OVERHEAD;
+ 	queue_work(ms912x->workqueue, &current_request->work);
+ 	ms912x->current_request = 1 - ms912x->current_request;
+-	goto dev_exit;
++	ms912x->last_send = jiffies;
++	goto unlock;
+ 
+ request_complete:
+ 	complete(&current_request->done);
+-dev_exit:
++unlock:
++	mutex_unlock(&ms912x->send_lock);
+ 	drm_dev_exit(idx);
+ 	return ret;
+ }
++
++/*
++ * Diagnostic keepalive for the suspected controller idle timeout. When no
++ * frame update has been queued for keepalive_ms, resend a 2x1 rect copied
++ * from the most recently queued request, so the pixels sent are the ones
++ * the device should already be showing. 0 disables it.
++ */
++static unsigned int keepalive_ms;
++module_param(keepalive_ms, uint, 0644);
++MODULE_PARM_DESC(keepalive_ms,
++		 "Resend a 2x1 rect after this many idle ms, 0 to disable (default: 0)");
++
++#define MS912X_KEEPALIVE_POLL_MS	1000
++#define MS912X_KEEPALIVE_WIDTH		2
++#define MS912X_KEEPALIVE_LEN \
++	(MS912X_KEEPALIVE_WIDTH * 2 + MS912X_FRAME_OVERHEAD)
++
++/* Call with send_lock held. Returns true if a transfer was queued. */
++static bool ms912x_keepalive_queue(struct ms912x_device *ms912x)
++{
++	struct ms912x_usb_request *last =
++		&ms912x->requests[1 - ms912x->current_request];
++	struct ms912x_usb_request *request = &ms912x->keepalive_request;
++	const struct ms912x_frame_update_header *last_header =
++		last->transfer_buffer;
++	struct ms912x_frame_update_header *header = request->transfer_buffer;
++	u32 dimensions = (MS912X_KEEPALIVE_WIDTH << 12) | 1;
++	u8 *dst;
++
++	/* Nothing has been sent since probe, so there are no pixels to copy. */
++	if (last->transfer_len < MS912X_KEEPALIVE_LEN)
++		return false;
++
++	/* Previous keepalive still in flight, never overlap it. */
++	if (!try_wait_for_completion(&request->done))
++		return false;
++
++	header->marker = last_header->marker;
++	memcpy(header->position, last_header->position,
++	       sizeof(header->position));
++	header->dimensions[0] = dimensions >> 16;
++	header->dimensions[1] = dimensions >> 8;
++	header->dimensions[2] = dimensions;
++
++	/* The first UYVY pair of the last rect is its top-left pixel pair. */
++	dst = request->transfer_buffer + sizeof(*header);
++	memcpy(dst, last->transfer_buffer + sizeof(*header),
++	       MS912X_KEEPALIVE_WIDTH * 2);
++	dst += MS912X_KEEPALIVE_WIDTH * 2;
++	memcpy(dst, ms912x_end_of_buffer, sizeof(ms912x_end_of_buffer));
++
++	request->transfer_len = MS912X_KEEPALIVE_LEN;
++	queue_work(ms912x->workqueue, &request->work);
++	return true;
++}
++
++static void ms912x_keepalive_work(struct work_struct *work)
++{
++	struct ms912x_device *ms912x =
++		container_of(to_delayed_work(work), struct ms912x_device,
++			     keepalive_work);
++	unsigned int interval = READ_ONCE(keepalive_ms);
++	unsigned long delay = msecs_to_jiffies(MS912X_KEEPALIVE_POLL_MS);
++	int idx;
++
++	if (!READ_ONCE(ms912x->keepalive_running))
++		return;
++
++	if (!drm_dev_enter(&ms912x->drm, &idx))
++		return;
++
++	if (interval) {
++		unsigned long due;
++
++		delay = msecs_to_jiffies(interval);
++		mutex_lock(&ms912x->send_lock);
++		due = ms912x->last_send + delay;
++		if (time_before(jiffies, due)) {
++			delay = due - jiffies;
++		} else if (ms912x_keepalive_queue(ms912x)) {
++			ms912x->last_send = jiffies;
++			ms912x->keepalive_sent++;
++			pr_info_ratelimited("ms912x keepalive: sent=%u skipped=%u idle_ms=%u\n",
++					    ms912x->keepalive_sent,
++					    ms912x->keepalive_skipped,
++					    interval);
++		} else {
++			ms912x->keepalive_skipped++;
++		}
++		mutex_unlock(&ms912x->send_lock);
++	}
++
++	drm_dev_exit(idx);
++
++	if (READ_ONCE(ms912x->keepalive_running))
++		queue_delayed_work(system_wq, &ms912x->keepalive_work, delay);
++}
++
++void ms912x_keepalive_init(struct ms912x_device *ms912x)
++{
++	mutex_init(&ms912x->send_lock);
++	INIT_DELAYED_WORK(&ms912x->keepalive_work, ms912x_keepalive_work);
++}
++
++void ms912x_keepalive_start(struct ms912x_device *ms912x)
++{
++	mutex_lock(&ms912x->send_lock);
++	ms912x->last_send = jiffies;
++	mutex_unlock(&ms912x->send_lock);
++
++	WRITE_ONCE(ms912x->keepalive_running, true);
++	queue_delayed_work(system_wq, &ms912x->keepalive_work,
++			   msecs_to_jiffies(MS912X_KEEPALIVE_POLL_MS));
++}
++
++void ms912x_keepalive_stop(struct ms912x_device *ms912x)
++{
++	struct ms912x_usb_request *request = &ms912x->keepalive_request;
++
++	WRITE_ONCE(ms912x->keepalive_running, false);
++	cancel_delayed_work_sync(&ms912x->keepalive_work);
++
++	/* Same pattern as ms912x_cancel_transfer_work() for frame requests. */
++	if (request->transfer_buffer && cancel_work_sync(&request->work))
++		complete(&request->done);
++}
+-- 
+2.56.0
+

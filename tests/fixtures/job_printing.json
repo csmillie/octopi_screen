@@ -1,0 +1,30 @@
+{
+  "job": {
+    "averagePrintTime": 27441.489530695006,
+    "estimatedPrintTime": 20930.983398137432,
+    "filament": {
+      "tool0": {
+        "length": 4543.545749999613,
+        "volume": 10.928508242546055
+      }
+    },
+    "file": {
+      "date": 1794246084,
+      "display": "Snacker2-vert.gcode",
+      "name": "Snacker2-vert.gcode",
+      "origin": "local",
+      "path": "Snacker2-vert.gcode",
+      "size": 4482572
+    },
+    "lastPrintTime": 27441.489530695006,
+    "user": "octopi"
+  },
+  "progress": {
+    "completion": 40.8,
+    "filepos": 1830000,
+    "printTime": 11200,
+    "printTimeLeft": 16200,
+    "printTimeLeftOrigin": "linear"
+  },
+  "state": "Printing"
+}
