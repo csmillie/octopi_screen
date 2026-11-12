@@ -109,10 +109,11 @@ deploy/deploy.sh --install                  # first install
 deploy/deploy.sh                            # later updates: sync code, restart
 ```
 
-`--install` copies the code to `~/pi-screen`, creates `.venv` there, and installs two root-owned files:
+`--install` copies the code to `~/pi-screen`, creates `.venv` there, and installs three root-owned files:
 
 - `/etc/systemd/system/pi-screen.service`
 - `/usr/local/sbin/pi-screen-console`, a helper that detaches the text console from the LCD while the dashboard runs and reattaches it when the dashboard stops
+- `/etc/udev/rules.d/99-pi-screen.rules`, which runs the helper as soon as the LCD is plugged in. The helper clears and hides the console and starts the dashboard straight away, so the login prompt is not left on screen while systemd's restart timer runs. It does nothing if the service is disabled.
 
 Only that helper runs as root. The dashboard process itself does not.
 
@@ -138,7 +139,7 @@ It reads OctoPrint's API key from `~/.octoprint/config.yaml`, so no extra config
 - Every 15 seconds while the printer is connected, it sends `M220` and `M221` to read speed and flow. It sends no other G-code.
 - Draws with Pillow into `/dev/fb0` through `mmap`, and only redraws regions that changed. The driver converts every changed pixel on the CPU, so small updates matter on a Pi that is also running a print. Plain `write()` calls to the framebuffer do not reach the panel with this driver, which is why it uses `mmap`.
 - Skips rendering when nothing visible has changed. When idle it uses about 3% of one core and about 35 MB of memory.
-- If the LCD is unplugged, the process exits with status 3. systemd retries every 5 seconds and redraws the whole screen when the LCD returns.
+- If the LCD is unplugged, the process exits with status 3, and systemd keeps retrying every 5 seconds. When the LCD is plugged back in, the udev rule starts the dashboard at once and it redraws the whole screen.
 
 ## Operating
 
@@ -165,5 +166,6 @@ The design notes and implementation plan are in [`docs/superpowers/`](docs/super
 
 ## Licences
 
+- The dashboard, deploy scripts and documentation are under the BSD 3-Clause licence in [`LICENSE`](LICENSE).
 - The driver patches modify GPL-2.0 code and are released under GPL-2.0.
 - The bundled DejaVu fonts are under the licence in [`pi_screen/fonts/LICENSE-DejaVu`](pi_screen/fonts/LICENSE-DejaVu).

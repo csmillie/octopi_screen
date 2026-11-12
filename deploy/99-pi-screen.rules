@@ -1,0 +1,4 @@
+# When the MS912x LCD is plugged in, hide the text console straight away and
+# start the dashboard, instead of showing the login prompt until systemd's
+# 5-second restart timer comes round.
+ACTION=="add", SUBSYSTEM=="graphics", KERNEL=="fb[0-9]*", ATTR{name}=="ms912xdrmfb", RUN+="/usr/local/sbin/pi-screen-console hotplug"

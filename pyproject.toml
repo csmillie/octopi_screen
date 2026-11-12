@@ -3,6 +3,7 @@ name = "pi-screen"
 version = "0.1.0"
 description = "OctoPrint status dashboard for the MS912x USB LCD"
 requires-python = ">=3.11"
+license = { text = "BSD-3-Clause" }
 dependencies = [
     "pillow==9.4.0",
     "requests==2.28.1",

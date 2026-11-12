@@ -200,3 +200,33 @@ def test_blinking_border_renders_each_phase(tmp_path):
     clock.now += 1
     dash.tick()
     assert dash.renderer.calls == 2
+
+
+def test_lost_octoprint_estimate_counts_down_instead_of_using_slicer(tmp_path):
+    # OctoPrint drops its estimate when it goes negative near the end of an
+    # overrunning print; the screen must not flip to the slicer's figure.
+    (tmp_path / "Snacker2-vert.gcode").write_bytes((FIXTURES / "s3d_sample.gcode").read_bytes())
+    client = FakeClient("job_printing", "printer_printing")
+    client.job["progress"].update(printTime=28000, printTimeLeft=180)
+    dash, _, _, clock = make(tmp_path, client)
+    dash.tick()
+    assert dash.last_view.remaining == "0:03"
+
+    client.job["progress"].update(printTime=28060, printTimeLeft=None)
+    clock.now += 60
+    dash.tick()
+    assert dash.last_view.remaining == "0:02"
+    assert not dash.last_view.remaining_is_estimate
+
+
+def test_held_estimate_is_dropped_when_a_new_print_starts(tmp_path):
+    (tmp_path / "Snacker2-vert.gcode").write_bytes((FIXTURES / "s3d_sample.gcode").read_bytes())
+    client = FakeClient("job_printing", "printer_printing")
+    dash, _, _, clock = make(tmp_path, client)
+    dash.tick()
+
+    client.job["job"]["file"].update(display="next.gcode", path="next.gcode")
+    client.job["progress"].update(printTime=10, printTimeLeft=None)
+    clock.now += 60
+    dash.tick()
+    assert dash.last_view.remaining == "—"

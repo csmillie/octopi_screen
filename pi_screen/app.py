@@ -21,7 +21,7 @@ from typing import Callable
 from .fb import Framebuffer, FramebufferGone
 from .gcode import GcodeInfoCache, current_layer
 from .history import HistoryStore, PrintTracker, reconcile
-from .model import Border, LastPrint, PrintEvent, View
+from .model import Border, LastPrint, PrintEvent, Snapshot, View
 from .parse import parse_flow, parse_snapshot, parse_speed
 from .render import Renderer, dirty_boxes
 from .view import build_view
@@ -54,6 +54,8 @@ class Dashboard:
         self._rendered_key = None
         self._last_poll = float("-inf")
         self._last_query = float("-inf")
+        # (file path, OctoPrint's last time-left estimate, when it was seen)
+        self._estimate: tuple[str | None, int, float] | None = None
         # Push events and log lines arrive on the listener thread.
         self._lock = threading.Lock()
 
@@ -104,10 +106,27 @@ class Dashboard:
         self._last_poll = now
         job = self.client.get_job()
         printer = self.client.get_printer() if job is not None else None
-        self.snap = parse_snapshot(job, printer)
+        self.snap = self._hold_estimate(parse_snapshot(job, printer), now)
         if not self.snap.printer_connected:
             # Values from before a disconnect may no longer be true.
             self.speed = self.flow = None
+
+    def _hold_estimate(self, snap: Snapshot, now: float) -> Snapshot:
+        """OctoPrint withdraws its time-left estimate whenever the estimate
+        turns negative, which happens repeatedly near the end of a print that
+        runs longer than predicted. Once it has given one for this print,
+        count down from the last value rather than fall back to the slicer."""
+        if snap.state not in ("printing", "paused"):
+            self._estimate = None
+            return snap
+        if snap.print_time_left is not None:
+            self._estimate = (snap.file_path, snap.print_time_left, now)
+            return snap
+        if self._estimate is None or self._estimate[0] != snap.file_path:
+            self._estimate = None
+            return snap
+        _, left, seen_at = self._estimate
+        return replace(snap, print_time_left=max(0, int(left - (now - seen_at))))
 
     def _gcode_info(self):
         if not self.snap.file_path:

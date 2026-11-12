@@ -2,9 +2,10 @@
 # Copy the dashboard to the Pi and restart it.
 #
 #   deploy/deploy.sh             sync code, update the venv, restart the service
-#   deploy/deploy.sh --install   also install the systemd unit and console
-#                                helper (first time only; needs `sudo -v` on
-#                                the Pi beforehand)
+#   deploy/deploy.sh --install   also install the systemd unit, the console
+#                                helper and the udev rule (first time, or when
+#                                one of them changes; needs `sudo -v` on the
+#                                Pi beforehand)
 set -euo pipefail
 
 HOST=${PI_SCREEN_HOST:-octopi@octopi.local}
@@ -28,6 +29,8 @@ if [ "${1:-}" = "--install" ]; then
 		cd $DEST
 		sudo -n install -m 0755 -o root -g root deploy/pi-screen-console /usr/local/sbin/pi-screen-console
 		sudo -n install -m 0644 -o root -g root deploy/pi-screen.service /etc/systemd/system/pi-screen.service
+		sudo -n install -m 0644 -o root -g root deploy/99-pi-screen.rules /etc/udev/rules.d/99-pi-screen.rules
+		sudo -n udevadm control --reload
 		sudo -n systemctl daemon-reload
 		sudo -n systemctl enable --now pi-screen"
 else

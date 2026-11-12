@@ -2,22 +2,59 @@
 # Detach (off) or reattach (on) the Linux text console from the framebuffer,
 # so the login prompt and its blinking cursor do not draw over the dashboard.
 #
-# Runs as root from the pi-screen systemd unit (ExecStartPre=+ / ExecStopPost=+).
-# Install root-owned: sudo install -m 0755 -o root -g root pi-screen-console /usr/local/sbin/
+#   off       from the pi-screen unit's ExecStartPre=+
+#   on        from the pi-screen unit's ExecStopPost=+
+#   hotplug   from the udev rule when the LCD is plugged in: hide the console
+#             at once and start the dashboard without waiting for systemd's
+#             restart timer, unless the service has been disabled
+#
+# Runs as root. Install root-owned: sudo install -m 0755 -o root -g root pi-screen-console /usr/local/sbin/
 set -euo pipefail
 
-case "${1:-}" in
-	off) bind=0 ;;
-	on) bind=1 ;;
-	*) echo "usage: $0 off|on" >&2; exit 2 ;;
-esac
+fb_vtcon() {
+	local vtcon
+	for vtcon in /sys/class/vtconsole/vtcon*; do
+		if grep -q "frame buffer device" "$vtcon/name"; then
+			echo "$vtcon"
+			return 0
+		fi
+	done
+	return 1
+}
 
-for vtcon in /sys/class/vtconsole/vtcon*; do
-	if grep -q "frame buffer device" "$vtcon/name"; then
-		echo "$bind" > "$vtcon/bind"
-		exit 0
+detach() {
+	local vtcon=$1
+	if [ "$(cat "$vtcon/bind")" = 1 ]; then
+		# Unbinding leaves the last console image on the panel until the
+		# dashboard draws, so clear it first: home, erase, hide the cursor.
+		printf '\033[H\033[2J\033[?25l' > /dev/tty0 || true
 	fi
-done
+	echo 0 > "$vtcon/bind"
+}
 
-# No framebuffer console, e.g. the LCD is unplugged: nothing to do.
-exit 0
+case "${1:-}" in
+	off)
+		# No framebuffer console, e.g. the LCD is unplugged: nothing to do.
+		if vtcon=$(fb_vtcon); then detach "$vtcon"; fi
+		;;
+	on)
+		if vtcon=$(fb_vtcon); then echo 1 > "$vtcon/bind"; fi
+		;;
+	hotplug)
+		systemctl is-enabled --quiet pi-screen || exit 0
+		# The console attaches to the new framebuffer just after the kernel
+		# announces it, so allow it a moment to appear.
+		for _ in $(seq 40); do
+			if vtcon=$(fb_vtcon); then
+				detach "$vtcon"
+				break
+			fi
+			sleep 0.05
+		done
+		systemctl --no-block start pi-screen
+		;;
+	*)
+		echo "usage: $0 off|on|hotplug" >&2
+		exit 2
+		;;
+esac
